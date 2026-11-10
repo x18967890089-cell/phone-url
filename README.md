@@ -38,7 +38,7 @@ $ php bin/phone-url.php --port=8080
 | 虚拟网卡 | VMware / WSL / Hyper-V 的 IP 手机连不上 | 网卡名命中的（`vEthernet`、`VMware`、`docker`、`wsl`…）直接降权 |
 | PPP / 校园网 | `PPP adapter` 看着像局域网，其实手机进不来 | `ppp`、`dial`、`wan miniport` 同样降权，排到真实 Wi-Fi 后面 |
 | 服务没起 | 网址输进去转圈，不知道是网络问题还是服务问题 | 本机先自测一次；不通就提示「先确认服务在跑」 |
-| 中文乱码 | 中文 Windows 的 `ipconfig` 是 GBK，正则抓到 `????` | `mb_check_encoding` 判一次，非 UTF-8 按 CP936 转 |
+| 中文乱码 | 控制台代码页是 437 时，`ipconfig` 在**离程序之前**就把「宽带连接」写成 `????`，转码救不回来 | Windows 上先走 `Get-NetAdapter` + `Get-NetIPAddress`（PowerShell 直接输出 UTF-8），`ipconfig` 只用来补 PPP/VPN 这类不在 NetAdapter 里的接口 |
 
 ## 快速开始
 
@@ -91,7 +91,8 @@ Windows 上双击 `bin/phone-url.bat` 也一样（它会自动 `chcp 65001` 防�
 ## 已知限制
 
 - 只处理 IPv4：IPv6 的地址形态和「手机能不能输入」完全是另一个问题，这里不做。
-- 中文 Windows 下网卡名可能显示成 `????`：那是控制台代码页在 `shell_exec` 之前就把非 ASCII 吃掉了，不影响 IP 与 URL 的正确性。
+- 中文 Windows 下若 PowerShell 不可用，会退回 `ipconfig`，此时接口名可能显示成 `PPP adapter [name unreadable in this code page]`：字符在进 PHP 之前就被控制台代码页替换了，IP 与 URL 仍然是对的。
+- Windows 分支需要 PowerShell（`Get-NetAdapter`）；极简 PE 或禁用 PowerShell 的环境会自动降级到 `ipconfig`。
 - 探测只到「有响应」：返回 302 跳登录页也算通，它不判断内容。
 - `PPP adapter`（校园网客户端 / VPN）虽然降权了，但如果你确实是通过 VPN 组网访问，得手动 `--prefer=` 指定那个网段。
 
