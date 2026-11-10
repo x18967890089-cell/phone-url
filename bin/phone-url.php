@@ -143,7 +143,13 @@ function localAddresses(): array
     $rows = [];
 
     if (stripos(PHP_OS_FAMILY, 'windows') !== false) {
-        $rows = parseIpconfig(toUtf8((string)@shell_exec('ipconfig 2>&1')));
+        // 纯 ipconfig 会把中文适配器名输出成 ????（控制台代码页 437 时尤其明显），
+        // 所以先用 PowerShell 取一份带描述的名称；PPP / VPN 这类不出现在 Get-NetAdapter
+        // 里的接口再用 ipconfig 补上（ASCII 前缀 "PPP adapter" 足以判定虚拟网卡）。
+        $rows = windowsAdapters();
+        foreach (parseIpconfig(toUtf8((string)@shell_exec('ipconfig 2>&1'))) as $row) {
+            $rows[] = $row;
+        }
     } elseif (is_executable('/sbin/ip') || is_executable('/usr/sbin/ip') || is_executable('/usr/bin/ip')) {
         $rows = parseIpAddr((string)@shell_exec('ip -4 -o addr show 2>/dev/null'));
     }
@@ -171,6 +177,66 @@ function localAddresses(): array
 }
 
 /**
+ * Windows：用 PowerShell 列出「适配器名 / 描述 / IPv4」，输出 UTF-8，中文名不会变成 ????。
+ *
+ * 脚本先写到临时 .ps1 再 -File 执行，避免 cmd.exe 把内层引号吃掉；
+ * PowerShell 不可用时返回空数组，调用方会退回 ipconfig。
+ *
+ * @return array<int, array{ip:string, iface:string, virtual:bool}>
+ */
+function windowsAdapters(): array
+{
+    $ps = <<<'PS'
+$ProgressPreference = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
+    $alias = $_.Name
+    $desc = $_.InterfaceDescription
+    Get-NetIPAddress -InterfaceIndex $_.ifIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+        $alias + '|' + $desc + '|' + $_.IPAddress
+    }
+}
+PS;
+    $tmp = @tempnam(sys_get_temp_dir(), 'phone-url-');
+    if ($tmp === false) {
+        return [];
+    }
+    $script = $tmp . '.ps1';
+    if (@file_put_contents($script, "\xEF\xBB\xBF" . $ps . "\r\n") === false) {
+        @unlink($tmp);
+
+        return [];
+    }
+    @unlink($tmp);
+    $raw = (string)@shell_exec('powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' . $script . '" 2>NUL');
+    @unlink($script);
+
+    return parseAdapterTable($raw);
+}
+
+/**
+ * @return array<int, array{ip:string, iface:string, virtual:bool}>
+ */
+function parseAdapterTable(string $raw): array
+{
+    $rows = [];
+    foreach (preg_split('/\r?\n/', $raw) ?: [] as $line) {
+        $line = trim($line);
+        if (substr_count($line, '|') !== 2) {
+            continue;
+        }
+        [$alias, $desc, $ip] = explode('|', $line);
+        if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
+            continue;
+        }
+        $label = trim($alias) . ($desc !== '' ? ' (' . trim($desc) . ')' : '');
+        $rows[] = ['ip' => trim($ip), 'iface' => $label, 'virtual' => isVirtual($label)];
+    }
+
+    return $rows;
+}
+
+/**
  * @return array<int, array{ip:string, iface:string, virtual:bool}>
  */
 function parseIpconfig(string $raw): array
@@ -186,7 +252,13 @@ function parseIpconfig(string $raw): array
             continue;
         }
         if (preg_match('/(?:IPv4|IPv4 地址)[^:]*:\s*([0-9.]+)/u', $line, $m) === 1) {
-            $rows[] = ['ip' => $m[1], 'iface' => $iface !== '' ? $iface : 'unknown', 'virtual' => isVirtual($iface)];
+            $name = $iface !== '' ? $iface : 'unknown';
+            if (str_contains($name, '?')) {
+                // 控制台代码页拿不到中文时只剩 ????，别把它原样丢给用户
+                $name = trim((string)preg_replace('/\?+/', '', $name));
+                $name = ($name !== '' ? $name : 'adapter') . ' [name unreadable in this code page]';
+            }
+            $rows[] = ['ip' => $m[1], 'iface' => $name, 'virtual' => isVirtual($iface)];
         }
     }
 
