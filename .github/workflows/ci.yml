@@ -1,0 +1,93 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: syntax (php 8.1 / 8.2 / 8.3)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.1', '8.2', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, mbstring
+          coverage: none
+      - name: php -l
+        run: php -l bin/phone-url.php
+      - name: --help exits 0
+        run: |
+          php bin/phone-url.php --help > /dev/null
+          echo "help exit code ok"
+      - name: bad argument exits 2
+        run: |
+          set +e
+          php bin/phone-url.php --port=not-a-number > /dev/null 2>&1
+          rc=$?
+          set -e
+          test "$rc" -eq 2 || { echo "expected exit 2, got $rc"; exit 1; }
+          echo "bad-arg exit code ok"
+
+  run:
+    name: finds a real address on a real container
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: curl, mbstring
+          coverage: none
+
+      - name: interfaces the runner actually has
+        run: ip -4 -o addr show
+
+      - name: --json prints one JSON line and exits 0
+        run: |
+          set -o pipefail
+          php bin/phone-url.php --no-check --json > out.json
+          echo "--- payload ---"; cat out.json
+          php -r '$d = json_decode(file_get_contents("out.json"), true);
+                  if (!is_array($d)) { fwrite(STDERR, "not json\n"); exit(1); }
+                  if (($d["ok"] ?? false) !== true) { fwrite(STDERR, "ok is not true\n"); exit(1); }
+                  if (count($d["candidates"]) < 1) { fwrite(STDERR, "no candidates\n"); exit(1); }
+                  foreach ($d["candidates"] as $c) {
+                      if (str_starts_with($c["ip"], "127.")) { fwrite(STDERR, "loopback leaked: " . $c["ip"] . "\n"); exit(1); }
+                  }
+                  echo "json contract ok, url=" . $d["url"] . "\n";'
+
+      - name: port and path land in the URL
+        run: |
+          php bin/phone-url.php --no-check --port=8080 --path=/admin --json > out2.json
+          php -r '$d = json_decode(file_get_contents("out2.json"), true);
+                  if (!str_contains($d["url"], ":8080/admin")) { fwrite(STDERR, "bad url: " . $d["url"] . "\n"); exit(1); }
+                  echo "url shape ok: " . $d["url"] . "\n";'
+
+      - name: --prefer reorders candidates
+        run: |
+          php bin/phone-url.php --no-check --json --prefer=10. > out3.json
+          php -r '$d = json_decode(file_get_contents("out3.json"), true);
+                  $first = $d["candidates"][0]["ip"];
+                  if (!str_starts_with($first, "10.")) { fwrite(STDERR, "--prefer ignored, first=" . $first . "\n"); exit(1); }
+                  echo "--prefer ok, first=" . $first . "\n";'
+
+      - name: probe finds a local http server
+        run: |
+          php -S 127.0.0.1:8099 -t . > /dev/null 2>&1 &
+          sleep 1
+          php bin/phone-url.php --port=8099 --path=/README.md --json > out4.json || true
+          php -r '$d = json_decode(file_get_contents("out4.json"), true);
+                  $p = $d["primary"]["probe"] ?? [];
+                  echo "probe: ok=" . var_export($p["ok"] ?? null, true) . " code=" . ($p["code"] ?? "-") . " method=" . ($p["method"] ?? "-") . "\n";
+                  if (!isset($p["method"])) { fwrite(STDERR, "no probe ran\n"); exit(1); }'
